@@ -20,12 +20,15 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_eigen REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(lpslam_interfaces REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(Eigen3 3.3 REQUIRED)
 
 SET(LPSLAM_BUILD_ROS2 ON CACHE BOOL "build with ROS2 support")
 SET(LPSLAM_BUILD_OPENVSLAM ON CACHE BOOL "enable")
@@ -44,6 +47,8 @@ if(BUILD_TESTING)
 endif()
 
 ## Build 
+include_directories(${EIGEN3_INCLUDE_DIR})
+
 add_executable(lpslam_node
   src/LpSlamNode.cpp
 )
@@ -57,9 +62,11 @@ ament_target_dependencies(lpslam_node
   rclcpp
   std_msgs
   sensor_msgs
+  geometry_msgs
   nav_msgs
   tf2
   tf2_ros
+  tf2_eigen
   tf2_geometry_msgs
   lpslam_interfaces)
 

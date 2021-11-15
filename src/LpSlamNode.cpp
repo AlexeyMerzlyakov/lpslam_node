@@ -14,7 +14,7 @@
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <geometry_msgs/msg/transform_stamped.h>
 #include <geometry_msgs/msg/pose_stamped.h>
-#include <geometry_msgs/msg/pose_stamped.h>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.h>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/map_meta_data.hpp>
 #include <lpslam_interfaces/msg/lp_slam_status.hpp>
@@ -34,6 +34,10 @@
 #include <mutex>
 #include <algorithm>
 #include <chrono>
+
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+#include <tf2_eigen/tf2_eigen.h>
 
 #include <yaml-cpp/yaml.h>
 
@@ -90,6 +94,8 @@ public:
             "right_image_topic", "right_image_raw");
         const std::string camera_info_topic = this->declare_parameter<std::string>(
             "camera_info_topic", "");
+        const std::string initial_pose_topic = this->declare_parameter<std::string>(
+            "initial_pose_topic", "initialpose");
         m_cameraFps = this->declare_parameter<double>("camera_fps", 5.0);
         const auto map_name = this->declare_parameter<std::string>("map_name", "/map");
         const std::string laserscan_topic = this->declare_parameter<std::string>("laserscan_topic", "scan");
@@ -173,6 +179,11 @@ public:
                 camera_info_topic, video_qos,
                 std::bind(&LpSlamNode::camera_info_callback, this, std::placeholders::_1));
         }
+
+        m_initPoseSubscription =
+            this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+                initial_pose_topic, 1,
+                std::bind(&LpSlamNode::init_pose_callback, this, std::placeholders::_1));
 
         m_pointcloudPublisher = this->create_publisher<sensor_msgs::msg::PointCloud2>(pointcloud_topic, 1);
 
@@ -598,6 +609,69 @@ private:
         camera_configured_ = true;
     }
 
+    void init_pose_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
+    {
+        const Eigen::Translation3d trans(
+            msg->pose.pose.position.x,
+            msg->pose.pose.position.y,
+            msg->pose.pose.position.z);
+        const Eigen::Quaterniond rot_q(
+            msg->pose.pose.orientation.w,
+            msg->pose.pose.orientation.x,
+            msg->pose.pose.orientation.y,
+            msg->pose.pose.orientation.z);
+        const Eigen::Affine3d initialpose_affine(trans * rot_q);
+
+        Eigen::Matrix3d rot_cv_to_ros_matrix;
+        rot_cv_to_ros_matrix << 0, -1, 0,
+               0, 0, -1,
+               1, 0, 0;
+        const Eigen::Affine3d rot_cv_to_ros_map_frame(rot_cv_to_ros_matrix);
+
+        Eigen::Affine3d map_to_initialpose_frame_affine;
+        try {
+            auto map_to_initialpose_frame = m_tfBuffer->lookupTransform(
+                m_map_frame_id, msg->header.frame_id, tf2_ros::fromMsg(msg->header.stamp),
+                tf2::durationFromSec(0.0));
+            map_to_initialpose_frame_affine = tf2::transformToEigen(
+                map_to_initialpose_frame.transform);
+        }
+        catch (tf2::TransformException& ex) {
+            RCLCPP_ERROR(get_logger(), "Transform failed: %s", ex.what());
+            return;
+        }
+
+        Eigen::Affine3d base_link_to_camera_affine;
+        try {
+            auto base_link_to_camera = m_tfBuffer->lookupTransform(
+                m_base_frame_id, m_camera_frame_id, tf2_ros::fromMsg(msg->header.stamp),
+                tf2::durationFromSec(0.0));
+            base_link_to_camera_affine = tf2::transformToEigen(base_link_to_camera.transform);
+        }
+        catch (tf2::TransformException& ex) {
+            RCLCPP_ERROR(get_logger(), "Transform failed: %s", ex.what());
+            return;
+        }
+
+        // Target transform is map_cv -> camera_link_cv and known parameters are following:
+        //   rot_cv_to_ros_map_frame: T(map_cv -> map)
+        //   map_to_initialpose_frame_affine: T(map -> `msg->header.frame_id`)
+        //   initialpose_affine: T(`msg->header.frame_id` -> base_link)
+        //   base_link_to_camera_affine: T(base_link -> camera_link)
+        //   rot_cv_to_ros_map_frame.inverse(): T(camera_link -> camera_link_cv)
+        // The flow of the transformation is as follows:
+        //   map_cv -> map -> `msg->header.frame_id` -> base_link -> camera_link -> camera_link_cv
+        // Finally, pose in CW frame - is an inverted pose in CV (or WC) frame
+        Eigen::Matrix4d cam_pose_cw = (rot_cv_to_ros_map_frame * map_to_initialpose_frame_affine
+                                       * initialpose_affine * base_link_to_camera_affine
+                                       * rot_cv_to_ros_map_frame.inverse())
+                                          .matrix().inverse();
+
+        if (!m_slam.updateTrackersPose(cam_pose_cw)) {
+            RCLCPP_ERROR(get_logger(), "Can not set initial pose");
+        }
+    }
+
     void image_callback_left(const sensor_msgs::msg::Image::SharedPtr msg)
     {
         if (check_and_dispatch(msg, m_rightImageBuffer, m_rightImageTimestamp, m_rightImageMutex, true))
@@ -943,6 +1017,8 @@ public:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr m_leftImageSubscription;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr m_rightImageSubscription;
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr m_cameraInfoSubscription;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+        m_initPoseSubscription;
 
     // TF2 handlers
     std::shared_ptr<tf2_ros::TransformListener> m_tfListener;
